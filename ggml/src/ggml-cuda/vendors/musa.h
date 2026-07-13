@@ -12,12 +12,20 @@
 #define CUBLAS_GEMM_DEFAULT_TENSOR_OP MUBLAS_GEMM_DEFAULT
 #define CUBLAS_OP_N MUBLAS_OP_N
 #define CUBLAS_OP_T MUBLAS_OP_T
+#if MUSART_VERSION < 40300
+#define CUBLAS_DEFAULT_MATH MUBLAS_MATH_MODE_DEFAULT
+#else
 #define CUBLAS_DEFAULT_MATH MUBLAS_DEFAULT_MATH
+#endif
 #define CUBLAS_SIDE_RIGHT MUBLAS_SIDE_RIGHT
 #define CUBLAS_FILL_MODE_UPPER MUBLAS_FILL_MODE_UPPER
 #define CUBLAS_DIAG_NON_UNIT MUBLAS_DIAG_NON_UNIT
 #define CUBLAS_STATUS_SUCCESS MUBLAS_STATUS_SUCCESS
+#if MUSART_VERSION < 40300
+#define CUBLAS_TF32_TENSOR_OP_MATH MUBLAS_MATH_MODE_TP32_TENSOR
+#else
 #define CUBLAS_TF32_TENSOR_OP_MATH MUBLAS_TENSOR_OP_MATH
+#endif
 #define CUDA_R_16F  MUSA_R_16F
 #define CUDA_R_16BF MUSA_R_16BF
 #define CUDA_R_32F  MUSA_R_32F
@@ -36,7 +44,11 @@
 #define cublasSgemmStridedBatched mublasSgemmStridedBatched
 #define cublasStatus_t mublasStatus_t
 #define cublasOperation_t mublasOperation_t
+#if MUSART_VERSION < 40300
+#define cublasGetStatusString mublasStatus_to_string
+#else
 #define cublasGetStatusString mublasGetStatusString
+#endif
 #define cudaDataType_t musaDataType_t
 #define cudaDeviceCanAccessPeer musaDeviceCanAccessPeer
 #define cudaDeviceDisablePeerAccess musaDeviceDisablePeerAccess

@@ -1,8 +1,11 @@
 #include "fork-attn.cuh"
 
-#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+#if !defined(GGML_USE_HIP)
 
-#    include <mma.h>
+#    if !defined(GGML_USE_MUSA)
+#        include <mma.h>
+namespace wmma = nvcuda::wmma;
+#    endif
 
 namespace {
 
@@ -21,6 +24,7 @@ template <> __device__ __forceinline__ float fork_to_float(nv_bfloat16 value) {
     return __bfloat162float(value);
 }
 
+#if !defined(GGML_USE_MUSA)
 __device__ __forceinline__ float warp_sum(float value) {
 #    pragma unroll
     for (int offset = 16; offset > 0; offset >>= 1) {
@@ -28,7 +32,101 @@ __device__ __forceinline__ float warp_sum(float value) {
     }
     return __shfl_sync(0xffffffff, value, 0);
 }
+#endif
 
+#if defined(GGML_USE_MUSA)
+template <typename T, int D>
+__global__ void fork_attn_partial_musa(const char * __restrict__ q,
+                                      const char * __restrict__ k,
+                                      const char * __restrict__ v,
+                                      const int32_t * __restrict__ plan,
+                                      float * __restrict__ partial,
+                                      float2 * __restrict__ meta,
+                                      float  scale,
+                                      int    n_queries,
+                                      int    n_heads,
+                                      int    n_kv_heads,
+                                      int    n_kv,
+                                      int    n_splits,
+                                      size_t nbq1,
+                                      size_t nbq2,
+                                      size_t nbk1,
+                                      size_t nbk2,
+                                      size_t nbv1,
+                                      size_t nbv2) {
+    int block  = blockIdx.x;
+    const int q_head = block % n_heads;
+    block /= n_heads;
+    const int query = block % n_queries;
+    const int split = block / n_queries;
+    const int lane  = threadIdx.x;
+
+    if (plan[0] != plan_magic || plan[2] == 0) {
+        return;
+    }
+
+    const int   common_len    = plan[4];
+    const int * common        = plan + plan_header_size;
+    const int * private_lens  = common + n_kv;
+    const int * private_cells = private_lens + n_queries;
+    const int   gqa           = n_heads / n_kv_heads;
+    const int   kv_head       = q_head / gqa;
+    const int   n_common      = split < common_len ? (common_len - split + n_splits - 1) / n_splits : 0;
+    const int   private_len   = private_lens[query];
+    const int   n_private     = split < private_len ? (private_len - split + n_splits - 1) / n_splits : 0;
+    const char * q_row        = q + query * nbq1 + q_head * nbq2;
+
+    __shared__ float reduction[D];
+    __shared__ float row_max;
+    __shared__ float row_sum;
+    __shared__ float alpha;
+    __shared__ float beta;
+
+    if (lane == 0) {
+        row_max = -FLT_MAX;
+        row_sum = 0.0f;
+    }
+    float out = 0.0f;
+    __syncthreads();
+
+    for (int i = 0; i < n_common + n_private; ++i) {
+        const int p = split + (i < n_common ? i : i - n_common) * n_splits;
+        const int cell = i < n_common ? common[p] : private_cells[query * n_kv + p];
+
+        reduction[lane] = *(const float *) (q_row + lane * sizeof(float)) *
+                          fork_to_float(*(const T *) (k + cell * nbk1 + kv_head * nbk2 + lane * sizeof(T)));
+        __syncthreads();
+
+#    pragma unroll
+        for (int stride = D / 2; stride > 0; stride >>= 1) {
+            if (lane < stride) {
+                reduction[lane] += reduction[lane + stride];
+            }
+            __syncthreads();
+        }
+
+        if (lane == 0) {
+            const float score    = reduction[0] * scale;
+            const float next_max = fmaxf(row_max, score);
+            alpha                = row_sum == 0.0f ? 0.0f : expf(row_max - next_max);
+            beta                 = expf(score - next_max);
+            row_sum              = row_sum * alpha + beta;
+            row_max              = next_max;
+        }
+        __syncthreads();
+
+        out = out * alpha + beta *
+              fork_to_float(*(const T *) (v + cell * nbv1 + kv_head * nbv2 + lane * sizeof(T)));
+        __syncthreads();
+    }
+
+    const size_t row = (size_t(split) * n_queries + query) * n_heads + q_head;
+    partial[row * D + lane] = out;
+    if (lane == 0) {
+        meta[row] = make_float2(row_max, row_sum);
+    }
+}
+#else
 template <typename T, int D>
 __global__ void fork_attn_partial_wmma(const char * __restrict__ q,
                                        const char * __restrict__ k,
@@ -48,8 +146,6 @@ __global__ void fork_attn_partial_wmma(const char * __restrict__ q,
                                        size_t nbk2,
                                        size_t nbv1,
                                        size_t nbv2) {
-    using namespace nvcuda;
-
     const int split       = blockIdx.x % n_splits;
     const int kv_head     = blockIdx.x / n_splits;
     const int gqa         = n_heads / n_kv_heads;
@@ -286,6 +382,7 @@ __global__ void fork_attn_partial_wmma(const char * __restrict__ q,
         }
     }
 }
+#endif
 
 template <int D>
 __global__ void fork_attn_merge(const float * __restrict__ partial,
@@ -341,7 +438,6 @@ template <typename T, int D> void launch_fork_attn(ggml_backend_cuda_context & c
     const int    n_heads        = q->ne[2];
     const int    n_kv_heads     = k->ne[2];
     const int    n_kv           = k->ne[1];
-    const int    gqa            = n_heads / n_kv_heads;
     const int    n_splits       = std::min(max_splits, std::max(1, (n_kv + kv_per_split - 1) / kv_per_split));
     const size_t n_partial_rows = size_t(n_splits) * n_queries * n_heads;
 
@@ -353,6 +449,13 @@ template <typename T, int D> void launch_fork_attn(ggml_backend_cuda_context & c
     float scale;
     memcpy(&scale, dst->op_params, sizeof(scale));
 
+#if defined(GGML_USE_MUSA)
+    fork_attn_partial_musa<T, D><<<n_splits * n_queries * n_heads, D, 0, ctx.stream()>>>(
+        (const char *) q->data, (const char *) k->data, (const char *) v->data, (const int32_t *) plan->data,
+        partial.get(), meta.get(), scale, n_queries, n_heads, n_kv_heads, n_kv, n_splits, q->nb[1], q->nb[2], k->nb[1],
+        k->nb[2], v->nb[1], v->nb[2]);
+#else
+    const int    gqa         = n_heads / n_kv_heads;
     const int    n_rows      = n_queries * gqa;
     const int    n_row_tiles = (n_rows + 15) / 16;
     const int    nthreads    = std::max(std::min(n_rows, 16), n_row_tiles * (D / 16)) * WARP_SIZE;
@@ -363,6 +466,7 @@ template <typename T, int D> void launch_fork_attn(ggml_backend_cuda_context & c
         (const char *) q->data, (const char *) k->data, (const char *) v->data, (const int32_t *) plan->data,
         partial.get(), meta.get(), scale, n_queries, n_heads, n_kv_heads, n_kv, n_splits, q->nb[1], q->nb[2], k->nb[1],
         k->nb[2], v->nb[1], v->nb[2]);
+#endif
     CUDA_CHECK(cudaGetLastError());
 
     fork_attn_merge<D><<<n_queries * n_heads, D, 0, ctx.stream()>>>(partial.get(), meta.get(), (float *) dst->data,
@@ -375,7 +479,7 @@ template <typename T, int D> void launch_fork_attn(ggml_backend_cuda_context & c
 #endif
 
 bool ggml_cuda_fork_attn_supported(int device, const ggml_tensor * dst) {
-#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+#if defined(GGML_USE_HIP)
     GGML_UNUSED(device);
     GGML_UNUSED(dst);
     return false;
@@ -390,8 +494,15 @@ bool ggml_cuda_fork_attn_supported(int device, const ggml_tensor * dst) {
     const ggml_tensor * plan = dst->src[5];
     const int           cc   = ggml_cuda_info().devices[device].cc;
 
-    return GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_AMPERE && q->type == GGML_TYPE_F32 &&
-           dst->type == GGML_TYPE_F32 && (k->type == GGML_TYPE_F16 || k->type == GGML_TYPE_BF16) &&
+#if defined(GGML_USE_MUSA)
+    const bool device_supported = GGML_CUDA_CC_IS_MTHREADS(cc) && cc >= GGML_CUDA_CC_QY2;
+    const bool type_supported   = k->type == GGML_TYPE_F16;
+#else
+    const bool device_supported = GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_AMPERE;
+    const bool type_supported   = k->type == GGML_TYPE_F16 || k->type == GGML_TYPE_BF16;
+#endif
+
+    return device_supported && q->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 && type_supported &&
            k->type == v->type && (q->ne[0] == 64 || q->ne[0] == 128) && k->ne[0] == q->ne[0] && v->ne[0] == q->ne[0] &&
            k->ne[1] == v->ne[1] && k->ne[2] == v->ne[2] && q->ne[1] >= 2 && q->ne[1] <= 8 && q->ne[3] == 1 &&
            k->ne[3] == 1 && v->ne[3] == 1 && q->ne[2] % k->ne[2] == 0 && q->ne[1] * (q->ne[2] / k->ne[2]) <= 32 &&
@@ -402,10 +513,10 @@ bool ggml_cuda_fork_attn_supported(int device, const ggml_tensor * dst) {
 }
 
 void ggml_cuda_fork_attn(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+#if defined(GGML_USE_HIP)
     GGML_UNUSED(ctx);
     GGML_UNUSED(dst);
-    GGML_ABORT("ForkAttention is available only on CUDA");
+    GGML_ABORT("ForkAttention is unavailable on HIP");
 #else
     GGML_ASSERT(ggml_cuda_fork_attn_supported(ctx.device, dst));
     const ggml_tensor * q = dst->src[0];
@@ -417,12 +528,15 @@ void ggml_cuda_fork_attn(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         } else {
             launch_fork_attn<half, 128>(ctx, dst);
         }
-    } else {
+    }
+#if !defined(GGML_USE_MUSA)
+    else {
         if (q->ne[0] == 64) {
             launch_fork_attn<nv_bfloat16, 64>(ctx, dst);
         } else {
             launch_fork_attn<nv_bfloat16, 128>(ctx, dst);
         }
     }
+#endif
 #endif
 }

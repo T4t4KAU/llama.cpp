@@ -1,9 +1,9 @@
 # Experimental Qwen3 ForkAttention
 
-ForkAttention is an opt-in CUDA decode path for unified KV caches with multiple
+ForkAttention is an opt-in CUDA/MUSA decode path for unified KV caches with multiple
 sequences that share a prefix. The planner reads the real KV-cell sequence
 membership, emits exact physical indices for the common prefix and each private
-suffix, and dispatches a CUDA partial-softmax/merge kernel. Unsupported batches
+suffix, and dispatches a GPU partial-softmax/merge kernel. Unsupported batches
 continue through the regular llama.cpp FlashAttention path.
 
 Enable it with:
@@ -12,11 +12,21 @@ Enable it with:
 llama-server -m qwen3.gguf -ngl 99 -fa on --fork-attn
 ```
 
-`--fork-attn` enables the unified KV cache. The current CUDA kernel is selected
-only for causal Qwen3 decode batches with 2 to 8 one-token sequences, FP16 or
-BF16 KV, head dimensions 64 or 128, and a sufficiently valuable shared prefix.
-Prefill, single-sequence decode, unsupported layouts, other model families, and
-non-CUDA backends use the native path.
+`--fork-attn` enables the unified KV cache. The CUDA kernel supports FP16 and
+BF16 KV, while the MUSA kernel currently supports FP16 KV on QY2 or newer GPUs
+(for example, MTT S4000). Both paths are selected only for causal Qwen3 decode
+batches with 2 to 8 one-token sequences, head dimensions 64 or 128, and a
+sufficiently valuable shared prefix. Prefill, single-sequence decode,
+unsupported layouts, other model families, and other backends use the native
+path.
+
+For an MTT S4000 build:
+
+```console
+cmake -S . -B build-musa -G Ninja -DGGML_MUSA=ON \
+  -DMUSA_ARCHITECTURES=22 -DGGML_NATIVE=OFF -DCMAKE_BUILD_TYPE=Release
+cmake --build build-musa -j
+```
 
 The server also changes idle-slot handling while ForkAttention is enabled.
 Idle sequence states stay in the GPU KV cache until allocation pressure occurs.
@@ -42,4 +52,4 @@ llama-parallel -m qwen3.gguf -ngl 99 -fa on --fork-attn \
 ```
 
 The backend correctness test contains an exact physical-KV plan and compares
-the CUDA result with the regular CPU FlashAttention reference.
+the GPU result with the regular CPU FlashAttention reference.
