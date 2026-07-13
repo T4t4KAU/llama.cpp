@@ -4,7 +4,10 @@
 
 #    if !defined(GGML_USE_MUSA)
 #        include <mma.h>
+#        include <type_traits>
+#        if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= GGML_CUDA_CC_TURING
 namespace wmma = nvcuda::wmma;
+#        endif
 #    endif
 
 namespace {
@@ -146,6 +149,19 @@ __global__ void fork_attn_partial_wmma(const char * __restrict__ q,
                                        size_t nbk2,
                                        size_t nbv1,
                                        size_t nbv2) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < GGML_CUDA_CC_TURING
+    GGML_UNUSED_VARS(q, k, v, plan, partial, meta, scale, n_queries, n_heads, n_kv_heads, n_kv, n_splits, nbq1, nbq2,
+                     nbk1, nbk2, nbv1, nbv2);
+    return;
+#else
+#    if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < GGML_CUDA_CC_AMPERE
+    // BF16 WMMA is unavailable before Ampere.
+    if constexpr (std::is_same<T, nv_bfloat16>::value) {
+        GGML_UNUSED_VARS(q, k, v, plan, partial, meta, scale, n_queries, n_heads, n_kv_heads, n_kv, n_splits, nbq1,
+                         nbq2, nbk1, nbk2, nbv1, nbv2);
+        return;
+    } else {
+#    endif
     const int split       = blockIdx.x % n_splits;
     const int kv_head     = blockIdx.x / n_splits;
     const int gqa         = n_heads / n_kv_heads;
@@ -381,6 +397,10 @@ __global__ void fork_attn_partial_wmma(const char * __restrict__ q,
             partial[row * D + lane + j * WARP_SIZE] = out[j];
         }
     }
+#    if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < GGML_CUDA_CC_AMPERE
+    }
+#    endif
+#endif
 }
 #endif
 
@@ -498,8 +518,9 @@ bool ggml_cuda_fork_attn_supported(int device, const ggml_tensor * dst) {
     const bool device_supported = GGML_CUDA_CC_IS_MTHREADS(cc) && cc >= GGML_CUDA_CC_QY2;
     const bool type_supported   = k->type == GGML_TYPE_F16;
 #else
-    const bool device_supported = GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_AMPERE;
-    const bool type_supported   = k->type == GGML_TYPE_F16 || k->type == GGML_TYPE_BF16;
+    const bool device_supported = turing_mma_available(cc);
+    const bool type_supported   = k->type == GGML_TYPE_F16 ||
+                                (ampere_mma_available(cc) && k->type == GGML_TYPE_BF16);
 #endif
 
     return device_supported && q->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 && type_supported &&
