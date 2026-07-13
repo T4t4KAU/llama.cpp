@@ -501,6 +501,10 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
     if (self_v_rot) {
         mctx->set_input_v_rot(self_v_rot);
     }
+
+    if (self_fork_attn_plan) {
+        mctx->set_input_fork_attn_plan(self_fork_attn_plan, ubatch);
+    }
 }
 
 bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
@@ -514,6 +518,16 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
   //res &= self_v_idxs->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
 
     res &= can_reuse_kq_mask(self_kq_mask, mctx, params.ubatch, params.cparams);
+
+    if (params.cparams.fork_attn || self_fork_attn_plan) {
+        const auto fork_plan = mctx->build_fork_attn_plan(params.ubatch);
+        if (self_fork_attn_plan) {
+            res &= fork_plan.active;
+            res &= self_fork_attn_plan->ne[0] == (int64_t) fork_plan.serialized_size();
+        } else {
+            res &= !fork_plan.active;
+        }
+    }
 
     return res;
 }
@@ -2381,7 +2395,8 @@ ggml_tensor * llm_graph_context::build_attn_mha(
          ggml_tensor * sinks,
          ggml_tensor * v_mla,
                float   kq_scale,
-                 int   il) const {
+                 int   il,
+         ggml_tensor * fork_attn_plan) const {
     const bool v_trans = v->nb[1] > v->nb[2];
 
     // split the batch into streams if needed
@@ -2412,9 +2427,14 @@ ggml_tensor * llm_graph_context::build_attn_mha(
             v = ggml_cast(ctx0, v, GGML_TYPE_F16);
         }
 
-        cur = ggml_flash_attn_ext(ctx0, q, k, v, kq_mask, kq_scale, hparams.f_max_alibi_bias,
-                                  hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
-        cb(cur, LLAMA_TENSOR_NAME_FATTN, il);
+        if (fork_attn_plan) {
+            cur = ggml_fork_attn_ext(ctx0, q, k, v, kq_mask, fork_attn_plan, kq_scale);
+            cb(cur, "fork_attn", il);
+        } else {
+            cur = ggml_flash_attn_ext(ctx0, q, k, v, kq_mask, kq_scale, hparams.f_max_alibi_bias,
+                                      hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
+            cb(cur, LLAMA_TENSOR_NAME_FATTN, il);
+        }
 
         ggml_flash_attn_ext_add_sinks(cur, sinks);
         ggml_flash_attn_ext_set_prec (cur, GGML_PREC_F32);
@@ -2589,7 +2609,8 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
      const llama_ubatch & ubatch,
     const llama_hparams & hparams,
     const llama_cparams & cparams,
-    const llama_kv_cache_context * mctx_cur) {
+    const llama_kv_cache_context * mctx_cur,
+                              bool fork_attn = false) {
 
     auto inp = std::make_unique<llm_graph_input_attn_kv>(hparams, cparams, mctx_cur);
 
@@ -2601,6 +2622,13 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
 
         inp->self_kq_mask = build_attn_inp_kq_mask(ctx0, mctx_cur, ubatch, cparams);
         inp->self_kq_mask_cnv = inp->self_kq_mask;
+
+        if (fork_attn) {
+            const auto plan = mctx_cur->build_fork_attn_plan(ubatch);
+            if (plan.active) {
+                inp->self_fork_attn_plan = mctx_cur->build_input_fork_attn_plan(ctx0, ubatch, plan);
+            }
+        }
     }
 
     inp->self_k_rot = mctx_cur->build_input_k_rot(ctx0);
@@ -2609,10 +2637,10 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
     return inp;
 }
 
-llm_graph_input_attn_kv * llm_graph_context::build_attn_inp_kv() const {
+llm_graph_input_attn_kv * llm_graph_context::build_attn_inp_kv(bool fork_attn) const {
     const auto * mctx_cur = static_cast<const llama_kv_cache_context *>(mctx);
 
-    auto inp = build_attn_inp_kv_impl(ctx0, ubatch, hparams, cparams, mctx_cur);
+    auto inp = build_attn_inp_kv_impl(ctx0, ubatch, hparams, cparams, mctx_cur, fork_attn);
 
     return (llm_graph_input_attn_kv *) res->add_input(std::move(inp));
 }
@@ -2665,7 +2693,7 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
 
-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
+    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il, inp->self_fork_attn_plan);
     cb(cur, "kqv_out", il);
 
     if (inp->self_v_rot) {

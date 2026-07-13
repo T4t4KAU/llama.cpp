@@ -1627,6 +1627,7 @@ server_prompt * server_prompt_cache::alloc(const server_prompt & prompt, size_t 
 
         if (cur_lcp_len == (int) prompt.tokens.size()) {
             SRV_TRC("%s", " - prompt is already in the cache, skipping\n");
+            duplicate_store_avoided++;
             return nullptr;
         }
     }
@@ -1672,6 +1673,9 @@ server_prompt * server_prompt_cache::alloc(const server_prompt & prompt, size_t 
         /*.checkpoints =*/ prompt.checkpoints,
     });
 
+    store_count++;
+    store_bytes += state_size_tgt + state_size_dft;
+
     return &states.back();
 }
 
@@ -1708,6 +1712,7 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
     if (it_best != states.end()) {
         SRV_TRC(" - found better prompt with f_keep = %.3f, sim = %.3f\n", f_keep_best, sim_best);
 
+        const size_t load_size = it_best->data.size();
         {
             auto & data = it_best->data.main;
 
@@ -1743,6 +1748,9 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
         }
 
         prompt = std::move(*it_best);
+
+        load_count++;
+        load_bytes += load_size;
 
         states.erase(it_best);
     }
@@ -1785,6 +1793,8 @@ void server_prompt_cache::update() {
 
     SRV_TRC(" - cache state: %zu prompts, %.3f MiB (limits: %.3f MiB, %zu tokens, %zu est)\n",
             states.size(), size() / (1024.0 * 1024.0), limit_size / (1024.0 * 1024.0), limit_tokens, limit_tokens_cur);
+    SRV_TRC(" - kv-offload: store=%" PRIu64 " (%.3f MiB), load=%" PRIu64 " (%.3f MiB), duplicate=%" PRIu64 "\n",
+            store_count, store_bytes / (1024.0 * 1024.0), load_count, load_bytes / (1024.0 * 1024.0), duplicate_store_avoided);
 
     for (const auto & state : states) {
         SRV_TRC("   - prompt %p: %7d tokens, checkpoints: %2zu, %9.3f MiB\n",

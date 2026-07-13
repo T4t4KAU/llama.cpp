@@ -5404,6 +5404,23 @@ struct ggml_tensor * ggml_flash_attn_ext(
     return result;
 }
 
+struct ggml_tensor * ggml_fork_attn_ext(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * mask,
+        struct ggml_tensor  * plan,
+        float                 scale) {
+    GGML_ASSERT(plan);
+    GGML_ASSERT(plan->type == GGML_TYPE_I32);
+    GGML_ASSERT(ggml_is_contiguous(plan));
+
+    struct ggml_tensor * result = ggml_flash_attn_ext(ctx, q, k, v, mask, scale, 0.0f, 0.0f);
+    result->src[5] = plan;
+    return result;
+}
+
 void ggml_flash_attn_ext_set_prec(
         struct ggml_tensor * a,
         enum ggml_prec       prec) {

@@ -6636,6 +6636,109 @@ struct test_flash_attn_ext : public test_case {
     }
 };
 
+// GGML_OP_FLASH_ATTN_EXT with an exact ForkAttention physical-KV plan
+struct test_fork_attn_ext : public test_case {
+    static constexpr int64_t plan_header_size = 8;
+
+    const bool fork;
+    const int64_t head_size;
+    const int64_t n_queries;
+    const int64_t n_heads;
+    const int64_t n_kv_heads;
+    const int64_t n_common;
+    const int64_t n_private;
+    const int64_t n_kv;
+    const ggml_type type_kv;
+
+    test_fork_attn_ext(bool fork, int64_t head_size = 128, int64_t n_queries = 4,
+            int64_t n_heads = 32, int64_t n_kv_heads = 8, int64_t n_common = 1024,
+            int64_t n_private = 64, ggml_type type_kv = GGML_TYPE_F16)
+        : fork(fork), head_size(head_size), n_queries(n_queries), n_heads(n_heads),
+          n_kv_heads(n_kv_heads), n_common(n_common), n_private(n_private),
+          n_kv(n_common + n_queries*n_private), type_kv(type_kv) {}
+
+    std::string vars() override {
+        return VARS_TO_STR8(fork, head_size, n_queries, n_heads, n_kv_heads, n_kv, n_common, type_kv);
+    }
+
+    double max_nmse_err() override {
+        return 5e-5;
+    }
+
+    uint64_t op_flops(ggml_tensor *) override {
+        return 2*n_heads*n_queries*(head_size + head_size)*(n_common + n_private);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32,
+                head_size, n_queries, n_heads, 1);
+        ggml_tensor * k = ggml_new_tensor_4d(ctx, type_kv,
+                head_size, n_kv, n_kv_heads, 1);
+        ggml_tensor * v = ggml_new_tensor_4d(ctx, type_kv,
+                head_size, n_kv, n_kv_heads, 1);
+        ggml_tensor * m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16,
+                n_kv, n_queries, 1, 1);
+        ggml_tensor * p = fork ? ggml_new_tensor_1d(ctx, GGML_TYPE_I32,
+                plan_header_size + n_kv + n_queries + n_queries*n_kv) : nullptr;
+
+        ggml_set_name(q, "q");
+        ggml_set_name(k, "k");
+        ggml_set_name(v, "v");
+        ggml_set_name(m, "m");
+        if (p) {
+            ggml_set_name(p, "plan");
+        }
+
+        ggml_tensor * out = fork ? ggml_fork_attn_ext(ctx, q, k, v, m, p,
+                1.0f/sqrtf(head_size)) : ggml_flash_attn_ext(ctx, q, k, v, m,
+                1.0f/sqrtf(head_size), 0.0f, 0.0f);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "plan") == 0) {
+                std::vector<int32_t> data(ggml_nelements(t), -1);
+                data[0] = 0x4641544e;
+                data[1] = 1;
+                data[2] = 1;
+                data[3] = n_queries;
+                data[4] = n_common;
+                data[5] = n_private;
+                data[6] = n_kv;
+
+                for (int32_t i = 0; i < n_common; ++i) {
+                    data[plan_header_size + i] = i;
+                }
+
+                const int64_t lengths_offset = plan_header_size + n_kv;
+                const int64_t private_offset = lengths_offset + n_queries;
+                for (int32_t iq = 0; iq < n_queries; ++iq) {
+                    data[lengths_offset + iq] = n_private;
+                    for (int32_t i = 0; i < n_private; ++i) {
+                        data[private_offset + iq*n_kv + i] = n_common + iq*n_private + i;
+                    }
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(data[0]));
+            } else if (strcmp(t->name, "m") == 0) {
+                std::vector<ggml_fp16_t> data(ggml_nelements(t), ggml_fp32_to_fp16(-INFINITY));
+                for (int32_t iq = 0; iq < n_queries; ++iq) {
+                    for (int32_t i = 0; i < n_common; ++i) {
+                        data[iq*n_kv + i] = ggml_fp32_to_fp16(0.0f);
+                    }
+                    for (int32_t i = 0; i < n_private; ++i) {
+                        data[iq*n_kv + n_common + iq*n_private + i] = ggml_fp32_to_fp16(0.0f);
+                    }
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(data[0]));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // GGML_OP_CROSS_ENTROPY_LOSS
 struct test_cross_entropy_loss : public test_case {
     const ggml_type type;
@@ -9169,6 +9272,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(128, 64, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q1_0, GGML_TYPE_Q4_0));
     test_cases.emplace_back(new test_flash_attn_ext(64, 128, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q1_0));
     test_cases.emplace_back(new test_flash_attn_ext(128, 64, 4, {1, 1}, 64, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q1_0, GGML_TYPE_F16));
+    test_cases.emplace_back(new test_fork_attn_ext(false));
+    test_cases.emplace_back(new test_fork_attn_ext(true));
+    test_cases.emplace_back(new test_fork_attn_ext(true, 64, 4, 8, 8, 128, 32, GGML_TYPE_BF16));
+    test_cases.emplace_back(new test_fork_attn_ext(true, 128, 4, 8, 1, 128, 32, GGML_TYPE_F16));
 
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {   10, 5, 4, 3}));
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {30000, 1, 1, 1}));
@@ -9484,6 +9591,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0));
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+    test_cases.emplace_back(new test_fork_attn_ext(false));
+    test_cases.emplace_back(new test_fork_attn_ext(true));
+    test_cases.emplace_back(new test_fork_attn_ext(false, 128, 8, 32, 8, 1024, 1024, GGML_TYPE_F16));
+    test_cases.emplace_back(new test_fork_attn_ext(true, 128, 8, 32, 8, 1024, 1024, GGML_TYPE_F16));
 
     for (int kv : { 4096, 8192, 16384, }) {
         for (int hs : { 64, 128, }) {

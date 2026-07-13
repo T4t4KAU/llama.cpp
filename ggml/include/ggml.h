@@ -2416,6 +2416,16 @@ extern "C" {
             float                 max_bias,
             float                 logit_softcap);
 
+    // CUDA-only Qwen3 decode fast path. Other backends may evaluate this as regular FlashAttention.
+    GGML_API struct ggml_tensor * ggml_fork_attn_ext(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * mask,
+            struct ggml_tensor  * plan,
+            float                 scale);
+
     GGML_API void ggml_flash_attn_ext_set_prec(
             struct ggml_tensor * a,
             enum ggml_prec       prec);

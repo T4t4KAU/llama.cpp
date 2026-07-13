@@ -2,6 +2,7 @@
 
 #include "llama-batch.h"
 #include "llama-graph.h"
+#include "llama-fork-attn.h"
 #include "llama-kv-cells.h"
 #include "llama-memory.h"
 
@@ -217,6 +218,9 @@ public:
     void set_input_k_rot(ggml_tensor * dst) const;
     void set_input_v_rot(ggml_tensor * dst) const;
 
+    llama_fork_attn_plan build_fork_attn_plan(const llama_ubatch & ubatch, uint32_t n_kv) const;
+    void record_fork_attn_plan(const llama_fork_attn_plan & plan) const;
+
 private:
     const llama_model & model;
     const llama_hparams & hparams;
@@ -286,6 +290,9 @@ private:
 
     // model layer id -> KV cache layer id
     std::unordered_map<int32_t, int32_t> map_layer_ids;
+
+    mutable uint64_t fork_attn_plans = 0;
+    mutable uint64_t fork_attn_saved_reads = 0;
 
     size_t total_size() const;
 
@@ -398,6 +405,13 @@ public:
 
     void set_input_k_rot(ggml_tensor * dst) const;
     void set_input_v_rot(ggml_tensor * dst) const;
+
+    llama_fork_attn_plan build_fork_attn_plan(const llama_ubatch & ubatch) const;
+    ggml_tensor * build_input_fork_attn_plan(
+            ggml_context * ctx,
+            const llama_ubatch & ubatch,
+            const llama_fork_attn_plan & plan) const;
+    void set_input_fork_attn_plan(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
 private:
     llama_memory_status status;

@@ -635,6 +635,12 @@ struct server_prompt_cache {
     // in tokens, 0 = no limit
     size_t limit_tokens = 0;
 
+    uint64_t store_count = 0;
+    uint64_t load_count  = 0;
+    uint64_t store_bytes = 0;
+    uint64_t load_bytes  = 0;
+    uint64_t duplicate_store_avoided = 0;
+
     size_t size() const;
 
     size_t n_tokens() const;

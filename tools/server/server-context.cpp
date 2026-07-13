@@ -1473,7 +1473,11 @@ private:
                 params_base.cache_idle_slots = false;
             } else {
                 if (params_base.kv_unified) {
-                    SRV_TRC("%s", "idle slots will be saved to prompt cache and cleared upon starting a new task\n");
+                    if (params_base.fork_attn) {
+                        SRV_TRC("%s", "idle slots will be saved and offloaded by shared-prefix value under KV pressure\n");
+                    } else {
+                        SRV_TRC("%s", "idle slots will be saved to prompt cache and cleared upon starting a new task\n");
+                    }
                 } else {
                     // without a unified KV cache, clearing a slot frees no reusable room, so we only
                     // publish a RAM-cache copy of idle slots (their KV stays in VRAM) [TAG_IDLE_SLOT_CLEAR]
@@ -1699,30 +1703,65 @@ private:
     //       - move slot to level 2 cache instead of removing?
     //       - instead of purging, try to store and resume later?
     bool try_clear_idle_slots() {
-        bool res = false;
-
         if (!params_base.kv_unified) {
-            return res;
+            return false;
         }
 
+        if (!params_base.fork_attn) {
+            for (auto & slot : slots) {
+                if (!slot.is_processing() && slot.prompt.n_tokens() > 0) {
+                    SRV_WRN("purging slot %d with %zu tokens\n", slot.id, slot.prompt.tokens.size());
+                    slot.prompt_clear(false);
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        server_slot * candidate = nullptr;
+        uint64_t candidate_value = UINT64_MAX;
+
         for (auto & slot : slots) {
-            if (slot.is_processing()) {
+            if (slot.is_processing() || slot.prompt.n_tokens() == 0) {
                 continue;
             }
 
-            if (slot.prompt.n_tokens() > 0) {
-                SRV_WRN("purging slot %d with %zu tokens\n", slot.id, slot.prompt.tokens.size());
+            uint64_t reuse_value = 0;
+            for (const auto & other : slots) {
+                if (other.id == slot.id || other.prompt.n_tokens() == 0) {
+                    continue;
+                }
+                const size_t shared = slot.prompt.tokens.get_common_prefix(other.prompt.tokens);
+                if (shared >= 64) {
+                    reuse_value += shared*(other.is_processing() ? 2 : 1);
+                }
+            }
 
-                slot.prompt_clear(false);
-
-                res = true;
-
-                // clear slots one by one
-                break;
+            if (!candidate || reuse_value < candidate_value ||
+                    (reuse_value == candidate_value && slot.t_last_used < candidate->t_last_used)) {
+                candidate = &slot;
+                candidate_value = reuse_value;
             }
         }
 
-        return res;
+        if (!candidate) {
+            return false;
+        }
+
+        if (prompt_cache) {
+            const int64_t t_start = ggml_time_us();
+            candidate->prompt_save(*prompt_cache);
+            prompt_cache->update();
+            SRV_WRN("offloading slot %d with %zu tokens to CPU (reuse_value=%" PRIu64 ", %.2f ms)\n",
+                    candidate->id, candidate->prompt.tokens.size(), candidate_value,
+                    (ggml_time_us() - t_start) / 1000.0);
+        } else {
+            SRV_WRN("purging slot %d with %zu tokens (RAM offload disabled)\n",
+                    candidate->id, candidate->prompt.tokens.size());
+        }
+
+        candidate->prompt_clear(false);
+        return true;
     }
 
     std::vector<common_adapter_lora_info> construct_lora_list(const std::map<int, float> & config) const {
@@ -2438,7 +2477,7 @@ private:
                                     prompt_cache->update();
                                 }
 
-                                if (params_base.kv_unified) {
+                                if (params_base.kv_unified && !params_base.fork_attn) {
                                     // [TAG_IDLE_SLOT_CLEAR]
                                     slot.prompt_clear(false);
                                 }

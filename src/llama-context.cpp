@@ -68,6 +68,8 @@ llama_context::llama_context(
     cparams.embeddings_nextn        = false;
     cparams.embeddings_nextn_masked = false;
     cparams.offload_kqv             = params.offload_kqv;
+    cparams.fork_attn               = params.fork_attn;
+    cparams.kv_unified              = params.kv_unified;
     cparams.no_perf                 = params.no_perf;
     cparams.warmup                  = false;
 
@@ -197,6 +199,19 @@ llama_context::llama_context(
     cparams.flash_attn = params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED;
     cparams.auto_fa    = params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO;
 
+    if (cparams.fork_attn) {
+        if (model.arch != LLM_ARCH_QWEN3) {
+            LLAMA_LOG_WARN("%s: ForkAttention currently supports only Qwen3; disabling\n", __func__);
+            cparams.fork_attn = false;
+        } else if (!cparams.causal_attn || !cparams.flash_attn || !cparams.offload_kqv) {
+            LLAMA_LOG_WARN("%s: ForkAttention requires causal FlashAttention with GPU KV offload; disabling\n", __func__);
+            cparams.fork_attn = false;
+        } else if (!cparams.kv_unified) {
+            cparams.kv_unified = true;
+            LLAMA_LOG_INFO("%s: enabling unified KV cache for ForkAttention\n", __func__);
+        }
+    }
+
     cparams.fused_gdn_ar = true;
     cparams.fused_gdn_ch = true;
     cparams.auto_fgdn    = true;
@@ -209,7 +224,6 @@ llama_context::llama_context(
     cparams.n_outputs_max = params.n_outputs_max == 0 || llama_model_has_encoder(&model) ? cparams.n_batch : params.n_outputs_max;
 
     cparams.op_offload = params.op_offload;
-    cparams.kv_unified = params.kv_unified;
 
     // initialized later
     cparams.pipeline_parallel = false;
@@ -250,6 +264,7 @@ llama_context::llama_context(
     LLAMA_LOG_INFO("%s: causal_attn   = %d\n",   __func__, cparams.causal_attn);
     LLAMA_LOG_INFO("%s: flash_attn    = %s\n",   __func__, llama_flash_attn_type_name(params.flash_attn_type));
     LLAMA_LOG_INFO("%s: kv_unified    = %s\n",   __func__, cparams.kv_unified ? "true" : "false");
+    LLAMA_LOG_INFO("%s: fork_attn     = %s\n",   __func__, cparams.fork_attn ? "true" : "false");
     LLAMA_LOG_INFO("%s: freq_base     = %.1f\n", __func__, cparams.rope_freq_base);
     LLAMA_LOG_INFO("%s: freq_scale    = %g\n",   __func__, cparams.rope_freq_scale);
     LLAMA_LOG_INFO("%s: n_rs_seq      = %u\n",   __func__, cparams.n_rs_seq);
@@ -3483,6 +3498,7 @@ llama_context_params llama_context_default_params() {
         /*.op_offload                  =*/ true,
         /*.swa_full                    =*/ true,
         /*.kv_unified                  =*/ false,
+        /*.fork_attn                   =*/ false,
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
         /*.ctx_other                   =*/ nullptr,

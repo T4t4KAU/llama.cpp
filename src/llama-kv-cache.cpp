@@ -7,11 +7,37 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cinttypes>
 #include <cmath>
 #include <cstring>
 #include <limits>
 #include <map>
 #include <stdexcept>
+
+std::vector<int32_t> llama_fork_attn_plan::serialize() const {
+    std::vector<int32_t> data(serialized_size(), -1);
+
+    data[0] = magic;
+    data[1] = version;
+    data[2] = active ? 1 : 0;
+    data[3] = (int32_t) n_queries;
+    data[4] = (int32_t) common_length;
+    data[5] = (int32_t) max_private_length;
+    data[6] = (int32_t) n_kv;
+    data[7] = 0;
+
+    std::copy(common.begin(), common.end(), data.begin() + header_size);
+
+    const size_t lengths_offset = header_size + n_kv;
+    const size_t private_offset = lengths_offset + n_queries;
+    for (uint32_t iq = 0; iq < n_queries; ++iq) {
+        data[lengths_offset + iq] = (int32_t) private_cells[iq].size();
+        std::copy(private_cells[iq].begin(), private_cells[iq].end(),
+                data.begin() + private_offset + iq*n_kv);
+    }
+
+    return data;
+}
 
 static bool ggml_is_power_of_2(int n) {
     return (n & (n - 1)) == 0;
@@ -1770,6 +1796,75 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
     //LLAMA_LOG_ERROR("%s: kq mask time: %0.3f ms\n", __func__, (t_end - t_start)/1000.0);
 }
 
+llama_fork_attn_plan llama_kv_cache::build_fork_attn_plan(
+        const llama_ubatch & ubatch, uint32_t n_kv) const {
+    llama_fork_attn_plan plan;
+    plan.n_kv = n_kv;
+    plan.n_queries = ubatch.n_tokens;
+    plan.private_cells.resize(plan.n_queries);
+
+    if (n_stream != 1 || ubatch.is_pos_2d() || ubatch.n_tokens < 2 || ubatch.n_tokens > 8 ||
+            ubatch.n_tokens != ubatch.n_seqs_unq || n_kv == 0) {
+        return plan;
+    }
+
+    std::vector<llama_seq_id> seq_ids(ubatch.n_tokens);
+    for (uint32_t iq = 0; iq < ubatch.n_tokens; ++iq) {
+        if (ubatch.n_seq_id[iq] != 1) {
+            return plan;
+        }
+        seq_ids[iq] = ubatch.seq_id[iq][0];
+        if (seq_ids[iq] < 0 || (size_t) seq_ids[iq] >= seq_to_stream.size()) {
+            return plan;
+        }
+    }
+
+    const auto & cells = v_cells.at(seq_to_stream[seq_ids[0]]);
+    for (uint32_t idx = 0; idx < n_kv; ++idx) {
+        if (cells.is_empty(idx)) {
+            continue;
+        }
+
+        bool common = true;
+        for (uint32_t iq = 0; iq < plan.n_queries; ++iq) {
+            if (!cells.seq_has(idx, seq_ids[iq]) || cells.pos_get(idx) > ubatch.pos[iq]) {
+                common = false;
+                break;
+            }
+        }
+
+        if (common) {
+            plan.common.push_back((int32_t) idx);
+            continue;
+        }
+
+        for (uint32_t iq = 0; iq < plan.n_queries; ++iq) {
+            if (cells.seq_has(idx, seq_ids[iq]) && cells.pos_get(idx) <= ubatch.pos[iq]) {
+                plan.private_cells[iq].push_back((int32_t) idx);
+            }
+        }
+    }
+
+    plan.common_length = plan.common.size();
+    for (const auto & private_cells : plan.private_cells) {
+        plan.max_private_length = std::max<uint32_t>(plan.max_private_length, private_cells.size());
+    }
+    plan.saved_kv_reads = uint64_t(plan.common_length)*(plan.n_queries - 1);
+    plan.active = plan.common_length >= 64 && plan.saved_kv_reads >= 128;
+
+    return plan;
+}
+
+void llama_kv_cache::record_fork_attn_plan(const llama_fork_attn_plan & plan) const {
+    fork_attn_plans++;
+    fork_attn_saved_reads += plan.saved_kv_reads;
+
+    if (fork_attn_plans == 1 || fork_attn_plans % 128 == 0) {
+        LLAMA_LOG_INFO("fork-attn: plans=%" PRIu64 ", queries=%u, common=%u, private_max=%u, saved_kv_reads=%" PRIu64 "\n",
+                fork_attn_plans, plan.n_queries, plan.common_length, plan.max_private_length, fork_attn_saved_reads);
+    }
+}
+
 void llama_kv_cache::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {
     const int64_t n_tokens = ubatch->n_tokens;
 
@@ -2649,4 +2744,29 @@ void llama_kv_cache_context::set_input_k_rot(ggml_tensor * dst) const {
 
 void llama_kv_cache_context::set_input_v_rot(ggml_tensor * dst) const {
     kv->set_input_v_rot(dst);
+}
+
+llama_fork_attn_plan llama_kv_cache_context::build_fork_attn_plan(const llama_ubatch & ubatch) const {
+    return kv->build_fork_attn_plan(ubatch, n_kv);
+}
+
+ggml_tensor * llama_kv_cache_context::build_input_fork_attn_plan(
+        ggml_context * ctx,
+        const llama_ubatch &,
+        const llama_fork_attn_plan & plan) const {
+    ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, plan.serialized_size());
+    ggml_set_input(result);
+    return result;
+}
+
+void llama_kv_cache_context::set_input_fork_attn_plan(ggml_tensor * dst, const llama_ubatch * ubatch) const {
+    GGML_ASSERT(dst->type == GGML_TYPE_I32);
+    GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
+
+    const auto plan = build_fork_attn_plan(*ubatch);
+    const auto data = plan.serialize();
+    GGML_ASSERT(plan.active);
+    GGML_ASSERT((int64_t) data.size() == dst->ne[0]);
+    memcpy(dst->data, data.data(), data.size()*sizeof(data[0]));
+    kv->record_fork_attn_plan(plan);
 }

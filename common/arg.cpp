@@ -1480,6 +1480,17 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_KV_UNIFIED").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PERPLEXITY, LLAMA_EXAMPLE_BATCHED, LLAMA_EXAMPLE_BENCH, LLAMA_EXAMPLE_PARALLEL}));
     add_opt(common_arg(
+        {"--fork-attn"},
+        {"--no-fork-attn"},
+        "enable experimental Qwen3 decode-only ForkAttention (default: disabled)",
+        [](common_params & params, bool value) {
+            params.fork_attn = value;
+            if (value) {
+                params.kv_unified = true;
+            }
+        }
+    ).set_env("LLAMA_ARG_FORK_ATTN").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PARALLEL}));
+    add_opt(common_arg(
         {"--cache-idle-slots"},
         {"--no-cache-idle-slots"},
         "save idle slots to the prompt cache on new task, and clear them when using unified KV (default: enabled, requires cache-ram)",
