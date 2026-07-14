@@ -434,6 +434,20 @@ typedef struct {
 } ggml_metal_kargs_flash_attn_ext_vec_reduce;
 
 typedef struct {
+    int32_t  n_queries;
+    int32_t  n_heads;
+    int32_t  n_kv_heads;
+    int32_t  n_kv;
+    uint64_t nbq1;
+    uint64_t nbq2;
+    uint64_t nbk1;
+    uint64_t nbk2;
+    uint64_t nbv1;
+    uint64_t nbv2;
+    float    scale;
+} ggml_metal_kargs_fork_attn_ext;
+
+typedef struct {
     int32_t  ne00;
     int32_t  ne02;
     uint64_t nb01;

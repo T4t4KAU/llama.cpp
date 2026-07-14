@@ -1534,6 +1534,27 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_v
     GGML_UNUSED(op);
 }
 
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_fork_attn_ext(
+        ggml_metal_library_t lib,
+        const ggml_tensor * op) {
+    assert(op->op == GGML_OP_FLASH_ATTN_EXT);
+
+    char base[256];
+    char name[256];
+
+    const int32_t dk = (int32_t) op->src[1]->ne[0];
+
+    snprintf(base, 256, "kernel_fork_attn_ext_%s_d%d", ggml_type_name(op->src[1]->type), dk);
+    snprintf(name, 256, "%s", base);
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, base, name, nullptr);
+    }
+
+    return res;
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_bin(ggml_metal_library_t lib, const ggml_tensor * op, int32_t n_fuse) {
     char base[256];
     char name[256];

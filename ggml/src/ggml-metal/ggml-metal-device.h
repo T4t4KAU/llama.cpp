@@ -202,6 +202,10 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_att
         int32_t dv,
         int32_t nwg);
 
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_fork_attn_ext(
+        ggml_metal_library_t lib,
+        const struct ggml_tensor * op);
+
 // MTLResidencySet wrapper
 
 typedef void * ggml_metal_rset_t;

@@ -7368,6 +7368,107 @@ kernel void kernel_flash_attn_ext_vec_reduce(
 #undef DV
 }
 
+template<typename kv_t>
+static inline float fork_attn_to_float(kv_t value) {
+    return (float) value;
+}
+
+template<typename kv_t, short D>
+kernel void kernel_fork_attn_ext(
+        constant ggml_metal_kargs_fork_attn_ext & args,
+        device const char * q,
+        device const char * k,
+        device const char * v,
+        device const int32_t * plan,
+        device       float * dst,
+        threadgroup  float * shmem [[threadgroup(0)]],
+        uint   tgpig[[threadgroup_position_in_grid]],
+        ushort tiitg[[thread_index_in_threadgroup]]) {
+    constexpr int32_t plan_header_size = 8;
+    constexpr int32_t plan_magic       = 0x4641544e;
+
+    const int32_t row_out = tgpig;
+    const int32_t query   = row_out%args.n_queries;
+    const int32_t q_head  = row_out/args.n_queries;
+    const int32_t gqa     = args.n_heads/args.n_kv_heads;
+    const int32_t kv_head = q_head/gqa;
+    const int32_t lane    = tiitg;
+
+    threadgroup float * reduction = shmem;
+    threadgroup float * row_max   = shmem + D;
+    threadgroup float * row_sum   = shmem + D + 1;
+    threadgroup float * alpha     = shmem + D + 2;
+    threadgroup float * beta      = shmem + D + 3;
+
+    if (lane == 0) {
+        row_max[0] = -FLT_MAX;
+        row_sum[0] = 0.0f;
+        alpha[0]   = 0.0f;
+        beta[0]    = 0.0f;
+    }
+
+    float out = 0.0f;
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (plan[0] == plan_magic && plan[2] != 0) {
+        const int32_t common_len = plan[4];
+
+        device const int32_t * common        = plan + plan_header_size;
+        device const int32_t * private_lens  = common + args.n_kv;
+        device const int32_t * private_cells = private_lens + args.n_queries;
+
+        const int32_t private_len = private_lens[query];
+        const int32_t total_len   = common_len + private_len;
+
+        device const char * q_row = q + query*args.nbq1 + q_head*args.nbq2;
+
+        for (int32_t i = 0; i < total_len; ++i) {
+            const int32_t p    = i < common_len ? i : i - common_len;
+            const int32_t cell = i < common_len ? common[p] : private_cells[query*args.n_kv + p];
+
+            device const kv_t * k_row = (device const kv_t *) (k + cell*args.nbk1 + kv_head*args.nbk2);
+
+            reduction[lane] = ((device const float *) q_row)[lane]*fork_attn_to_float(k_row[lane]);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            for (int32_t stride = D/2; stride > 0; stride >>= 1) {
+                if (lane < stride) {
+                    reduction[lane] += reduction[lane + stride];
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+
+            if (lane == 0) {
+                const float score    = reduction[0]*args.scale;
+                const float next_max = max(row_max[0], score);
+                alpha[0]             = row_sum[0] == 0.0f ? 0.0f : exp(row_max[0] - next_max);
+                beta[0]              = exp(score - next_max);
+                row_sum[0]           = row_sum[0]*alpha[0] + beta[0];
+                row_max[0]           = next_max;
+            }
+
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            device const kv_t * v_row = (device const kv_t *) (v + cell*args.nbv1 + kv_head*args.nbv2);
+            out = out*alpha[0] + beta[0]*fork_attn_to_float(v_row[lane]);
+
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+
+    dst[lane + D*(q_head + args.n_heads*query)] = row_sum[0] == 0.0f ? 0.0f : out/row_sum[0];
+}
+
+typedef decltype(kernel_fork_attn_ext<half, 128>) fork_attn_ext_t;
+
+template [[host_name("kernel_fork_attn_ext_f16_d64")]]  kernel fork_attn_ext_t kernel_fork_attn_ext<half, 64>;
+template [[host_name("kernel_fork_attn_ext_f16_d128")]] kernel fork_attn_ext_t kernel_fork_attn_ext<half, 128>;
+#if defined(GGML_METAL_HAS_BF16)
+template [[host_name("kernel_fork_attn_ext_bf16_d64")]]  kernel fork_attn_ext_t kernel_fork_attn_ext<bfloat, 64>;
+template [[host_name("kernel_fork_attn_ext_bf16_d128")]] kernel fork_attn_ext_t kernel_fork_attn_ext<bfloat, 128>;
+#endif
+
 template<typename T0, typename T1>
 kernel void kernel_cpy_t_t(
         constant ggml_metal_kargs_cpy & args,
